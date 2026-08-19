@@ -1,0 +1,14 @@
+[project]
+name = "sa3-inversion"
+version = "0.1.0"
+description = "Rectified-flow inversion for Stable Audio 3"
+requires-python = ">=3.10"
+dependencies = [
+    "stable-audio-3 @ git+https://github.com/Stability-AI/stable-audio-3",
+    "jupyter>=1.1.1",
+    "ipywidgets>=8.1.5",
+    "matplotlib>=3.10.0",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'"]
