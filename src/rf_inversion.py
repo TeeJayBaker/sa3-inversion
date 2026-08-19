@@ -23,6 +23,19 @@ gamma = eta = 0 gives plain deterministic inversion / re-sampling, which is the
 reconstruction sanity check. On medium-base that reconstructs a 10s clip to
 0.018 relative error in latent space at 50 steps — see `invert`'s
 `fixed_point_iters`, without which it is 0.63.
+
+Two solver pairings are available, set once via `invert_and_edit(solver=...)`:
+"midpoint" (default, the FireFlow scheme of Deng et al., 2024) and "fixed-point",
+which is what this repo used to default to and is paired with sample's "euler".
+Midpoint reconstructs several times more accurately for half the model evaluations
+— see `invert` for the numbers, and for why the two pairings want opposite
+schedules, which is why `solver` and `schedule` have to be changed together.
+
+The controllers are calibrated against the solver, not just the prompt: eta needs to
+be roughly a third of its old value to move the result as far, because a solver that
+already reconstructs cleanly gives it no drift to fight. See `sample`.
+
+For editing that skips the round trip altogether, see `flow_edit.py`.
 """
 
 import torch
@@ -36,8 +49,8 @@ EPS = 1e-3
 def get_schedule(model, steps, latent_len, device, schedule="model", logsnr_range=6.0):
     """Descending timestep schedule, t: 1 -> 0. Pass a tensor to use it verbatim.
 
-    "model"  — what SA3 uses for generation, and the best of these for inversion too.
-               t = sigmoid(8.2 * u - 2.0), endpoints forced to 0 and 1. Strongly
+    "model"  — what SA3 uses for generation, and the best of these for a fixed-point
+               inversion. t = sigmoid(8.2 * u - 2.0), endpoints forced to 0 and 1. Strongly
                noise-dense: at 25 steps dt is 0.0028 next to t=1 but 0.158 next to
                t=0, and 12 of the 25 steps sit above t=0.9 (the SD3/Flux "shift
                toward noise").
@@ -58,6 +71,10 @@ def get_schedule(model, steps, latent_len, device, schedule="model", logsnr_rang
     there costs far more than the extra low-t resolution buys. Steps matter more
     than spacing anyway: with "model" + fp=2, 25 -> 50 -> 100 steps gives
     0.154 -> 0.018 -> 0.007.
+
+    All of which holds for the fixed-point solver and inverts for the midpoint one,
+    whose error floor is set by that same low-t cliff rather than by the field at
+    t=1 — it wants "logsnr", and is the default. See `invert`.
     """
     if torch.is_tensor(schedule):
         return schedule.to(device)
@@ -122,6 +139,51 @@ def _blend(v_model, v_ctrl, weight, norm_match=False):
     return v_model + weight * (v_ctrl - v_model)
 
 
+def _integrate(x, t, velocity, solver, desc, disable_tqdm):
+    """Integrate dx/dt = velocity(x, t, i, stage) along the timestep sequence `t`.
+
+    `velocity` is the whole field being integrated, controller blend included, so
+    the solver never has to know which direction it is running or what is steering
+    it. `i` is the step index, for controllers with a start/stop window.
+
+    `stage` names *which* evaluation within the step this is — 0 for the one at the
+    interval's leading edge, 1 for the midpoint corrector. Nothing here uses it, and
+    a controller that only reads `x` and `t` does not need it either; it exists so
+    that something caching per-evaluation state can tell the two apart when the
+    midpoint solver calls in twice for one step. See `attn_inject`.
+
+    "euler"    — one evaluation per step at the interval's leading edge.
+    "midpoint" — FireFlow (Deng et al., 2024, arXiv:2412.07517). Evaluate at the
+                 interval midpoint instead, and carry that velocity over as the
+                 next step's predictor rather than paying for a fresh evaluation:
+
+                     v      = cached midpoint velocity from step i-1
+                     x_mid  = x + dt/2 * v
+                     v_mid  = velocity(x_mid, t + dt/2)
+                     x      = x + dt * v_mid
+
+                 That is second-order accuracy for one evaluation per step, the
+                 reuse being sound because rectified-flow trajectories are near
+                 straight, so v barely moves over half a step.
+    """
+    x = x.clone()
+    v_cache = None
+    steps = list(zip(t[:-1], t[1:]))
+
+    for i, (t_curr, t_next) in enumerate(tqdm(steps, desc=desc, disable=disable_tqdm)):
+        dt = t_next - t_curr
+        if solver == "euler":
+            x = x + dt * velocity(x, t_curr, i, 0)
+        elif solver == "midpoint":
+            v = velocity(x, t_curr, i, 0) if v_cache is None else v_cache
+            v_cache = velocity(x + 0.5 * dt * v, t_curr + 0.5 * dt, i, 1)
+            x = x + dt * v_cache
+        else:
+            raise ValueError(f"unknown solver {solver!r}: expected 'euler' or 'midpoint'")
+
+    return x
+
+
 @torch.inference_mode()
 def invert(
     model,
@@ -130,14 +192,49 @@ def invert(
     steps=50,
     gamma=0.0,
     target_noise=None,
-    schedule="model",
+    schedule="logsnr",
+    solver="midpoint",
     fixed_point_iters=2,
     norm_match=False,
+    attn=None,
     disable_tqdm=False,
 ):
     """Data -> noise. Integrates the flow ODE forward in t (0 -> 1).
 
-    `sample` steps down from t_next to t_curr as
+    `solver` picks how. It must match what `sample` is given on the way back —
+    "midpoint" pairs with itself, "fixed-point" pairs with sample's "euler" — since
+    reconstruction comes from the two passes discretising the ODE the same way, not
+    from either being accurate on its own. Mismatch them and a round trip that should
+    reconstruct at 0.0187 comes back at 0.118 instead.
+
+        solver         schedule   NFE    small-music-base   medium-base
+        midpoint       logsnr     102          0.0033          0.0044   <- default
+        midpoint       model      102          0.0282          0.0054
+        fixed-point    model      200          0.0187          0.0247
+
+    (Reconstruction relative error, 50 steps, both passes counted. The source clip is a
+    10s rain recording, not included in the repo, so exact figures will differ.)
+    "midpoint" + "logsnr" is the default on both checkpoints: half the model
+    evaluations for roughly a fifth of the error, and it leaves the inverted latent
+    at std 1.00 against fixed-point's 1.07, so it lands closer to the prior too.
+    That last point makes `gamma` largely redundant under it — the inversion already
+    arrives at the prior, so gamma > 0 mostly just costs reconstruction.
+
+    Note the middle row. `solver` and `schedule` are a pair, not two independent
+    knobs: midpoint on the "model" schedule is *worse* than the fixed-point default
+    it replaces, so changing one without the other is a regression, not a trade.
+
+    Note the schedule preference *inverts* with the solver, which is the same cliff
+    argument `get_schedule` makes from the other side. Fixed-point iteration is what
+    absorbs the wide interval "model" leaves next to t=0, so it is free to spend its
+    steps resolving the stiff field at t=1 and "model" wins. The midpoint scheme has
+    no such absorber, so that one interval sets its error floor — on small-music-base
+    it plateaus at ~0.024 no matter how many steps you add — and it wants "logsnr",
+    which tapers at both ends. Feed it "model" and you get the plateau; feed
+    fixed-point "logsnr" and it degrades to 0.0334.
+
+    `fixed_point_iters` applies to solver="fixed-point" only, and is what makes that
+    pairing work at all. `sample` steps down from t_next to t_curr as
 
         x_curr = x_next + (t_curr - t_next) * v(x_next, t_next)
 
@@ -165,16 +262,41 @@ def invert(
     closer to the Gaussian prior, at the cost of reconstruction fidelity. The
     controller stays explicit (evaluated at t_curr) — the schedule ends at
     exactly t = 1, where the controller's 1/(1 - t) would blow up.
+
+    `attn` is an optional callable announcing the identity of each model evaluation
+    just before it happens, as `attn(step, stage)`. It is what `attn_inject` uses to
+    key its feature cache. `step` is counted from the *noise* end, opposite to the
+    loop's own index, so that inversion and sampling name the same interval by the
+    same number even though they walk it in opposite directions.
     """
     dit = model.model.model
     t = get_schedule(model, steps, latent.shape[-1], latent.device, schedule).flip(0)  # ascending
     y = latent.clone()
     noise = torch.randn_like(y) if target_noise is None else target_noise
     batch = y.shape[0]
+    last = len(t) - 2  # this pass runs t ascending, so step i is `last - i` from the noise end
 
-    for t_curr, t_next in tqdm(
+    if solver != "fixed-point":
+        # The schedule starts at exactly t=0, which the model never saw in training;
+        # nudge the evaluation point off the boundary as SA3's own rk4 sampler does.
+        # The midpoint solver never evaluates at t=1, where the controller blows up.
+        def velocity(z, t_at, i, stage):
+            if attn is not None:
+                attn(last - i, stage)
+            v_ctrl = (noise - z) / (1.0 - t_at).clamp(min=EPS)
+            v_model = dit(z, t_at.clamp(min=1e-5).expand(batch), cfg_scale=1.0, **cond)
+            return _blend(v_model, v_ctrl, gamma, norm_match)
+
+        return _integrate(y, t, velocity, solver, "invert", disable_tqdm)
+
+    for i, (t_curr, t_next) in enumerate(tqdm(
         list(zip(t[:-1], t[1:])), desc="invert", disable=disable_tqdm
-    ):
+    )):
+        # Both of this step's evaluation points share one key, so the last write wins
+        # — the converged fixed-point iterate at t_next, which is exactly where
+        # `sample`'s Euler step will evaluate the same interval on the way back.
+        if attn is not None:
+            attn(last - i, 0)
         dt = t_next - t_curr  # > 0
         # The schedule starts at exactly t=0, which the model never saw in training;
         # nudge the evaluation point off the boundary the way SA3's own rk4 sampler does.
@@ -205,42 +327,64 @@ def sample(
     source_latent=None,
     start=0.0,
     stop=1.0,
-    schedule="model",
+    schedule="logsnr",
+    solver="midpoint",
     norm_match=False,
+    attn=None,
     disable_tqdm=False,
 ):
-    """Noise -> data. Euler integration of the flow ODE (t: 1 -> 0).
+    """Noise -> data. Integrates the flow ODE (t: 1 -> 0).
 
     eta > 0 steers back toward `source_latent` over the [start, stop] fraction of
     the trajectory, which is what preserves the original structure while the
     prompt changes the content.
+
+    **eta is calibrated against the solver.** It does not carry over from the old
+    fixed-point default, and the difference is large enough to look like a broken
+    edit rather than a weaker one. Drift from source, 10s of rain -> "a drum
+    breakbeat", 50 steps, cfg 6, stop=0.9:
+
+        eta            0.0    0.05   0.10   0.15   0.20   0.25   0.30   0.40
+        midpoint      1.262  0.850  0.594  0.411  0.286  0.207  0.155  0.090
+        fixed-point   1.392    —    —      —     0.680    —      —     0.429
+
+    So eta wants to be roughly a *third* of its fixed-point value for the same
+    movement: the old default of 0.4 corresponds to about 0.15 here, and 0.4 under
+    midpoint returns very nearly the source. The reason is that eta pulls toward
+    `source_latent`, and under a solver that already reconstructs to 0.003 there is
+    no solver drift left for it to fight, so the same weight simply locks the output
+    down. Midpoint also holds the output scale better — std 0.69-0.72 against
+    fixed-point's 0.82-0.85, where the source itself is 0.664.
+
+    `solver` must match the one `invert` was given: "midpoint" is its own partner,
+    "euler" is the partner of inversion's "fixed-point". See `invert`.
+
+    `attn` is the same optional evaluation-identity callback `invert` takes, and
+    here the loop index already counts from the noise end, so it is passed through
+    as it stands. See `attn_inject`.
     """
     dit = model.model.model
     t = get_schedule(model, steps, noise.shape[-1], noise.device, schedule)  # descending
-    x = noise.clone()
 
     n_steps = len(t) - 1
     first, last = int(start * n_steps), int(stop * n_steps)
 
-    for i, (t_curr, t_next) in enumerate(
-        tqdm(list(zip(t[:-1], t[1:])), desc="sample", disable=disable_tqdm)
-    ):
-        dt = t_next - t_curr  # < 0
+    def velocity(x, t_at, i, stage):
+        if attn is not None:
+            attn(i, stage)
         v_model = dit(
             x,
-            t_curr.expand(x.shape[0]),
+            t_at.expand(x.shape[0]),
             cfg_scale=cfg_scale,
             apg_scale=apg_scale,
             **cond,
         )
         if eta != 0.0 and first <= i <= last:
-            v_ctrl = (x - source_latent) / t_curr.clamp(min=EPS)
-            v = _blend(v_model, v_ctrl, eta, norm_match)
-        else:
-            v = v_model
-        x = x + dt * v
+            v_ctrl = (x - source_latent) / t_at.clamp(min=EPS)
+            return _blend(v_model, v_ctrl, eta, norm_match)
+        return v_model
 
-    return x
+    return _integrate(noise, t, velocity, solver, "sample", disable_tqdm)
 
 
 def invert_and_edit(
@@ -255,9 +399,10 @@ def invert_and_edit(
     eta=0.0,
     start=0.0,
     stop=1.0,
-    cfg_scale=1.0,
+    cfg_scale=7.0,
     apg_scale=1.0,
-    schedule="model",
+    schedule="logsnr",
+    solver="midpoint",
     fixed_point_iters=2,
     norm_match=False,
     seed=None,
@@ -265,10 +410,20 @@ def invert_and_edit(
 ):
     """Full pipeline: invert `latent` under `source_prompt`, re-sample under `target_prompt`.
 
+    `solver` is set once here and the matched partner is chosen for each pass, since
+    the pairing is the whole reason a round trip reconstructs — see `invert`. It
+    defaults to "midpoint" + schedule="logsnr"; pass solver="fixed-point" with
+    schedule="model" to get the older pairing back as a matched set.
+
+    If you are porting `eta` values from the fixed-point default, scale them to
+    roughly a third — see `sample`.
+
     Returns (edited_latent, inverted_noise).
     """
     if seed is not None:
         torch.manual_seed(seed)
+
+    sample_solver = "euler" if solver == "fixed-point" else solver
 
     latent_len = latent.shape[-1]
     batch_size = latent.shape[0]
@@ -281,6 +436,7 @@ def invert_and_edit(
         steps=inversion_steps,
         gamma=gamma,
         schedule=schedule,
+        solver=solver,
         fixed_point_iters=fixed_point_iters,
         norm_match=norm_match,
         disable_tqdm=disable_tqdm,
@@ -299,6 +455,7 @@ def invert_and_edit(
         start=start,
         stop=stop,
         schedule=schedule,
+        solver=sample_solver,
         norm_match=norm_match,
         disable_tqdm=disable_tqdm,
     )

@@ -1,3 +1,8 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
+.DS_Store
+
+# generated clips; source material is whitelisted
+audio/*
+!audio/loop.wav
